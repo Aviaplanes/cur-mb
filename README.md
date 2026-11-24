@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="demo.gif" alt="Cursor Motion Blur Demo" width="600">
+</p>
+
 # curmb
 
 Standalone Windows 11 x64 cursor motion blur. No Windhawk or additional runtime
