@@ -1,4 +1,4 @@
-#include "../blend.h"
+#include "kernels.h"
 #include <chrono>
 #include <cstdio>
 #include <cstring>

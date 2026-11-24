@@ -1,8 +1,8 @@
 // Standalone adaptation of mod.wh.cpp (Unlicense, sidlikesgrapess).
 // No Windhawk runtime or process injection is used.
 #include <windows.h>
-#include "blend.h"
-#include "trail.h"
+#include <cstdint>
+#include <emmintrin.h>
 #include <atomic>
 #include <mmsystem.h>
 #include <shellapi.h>
@@ -13,12 +13,69 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef CURMB_SHARP_HEAD
-#define CURMB_SHARP_HEAD 0
-#endif
-#ifndef CURMB_FAST_FRAMES
-#define CURMB_FAST_FRAMES 0
-#endif
+// BEGIN TESTABLE PIXEL AND TRAIL KERNELS
+// Each executable is built from its own source file, including these kernels.
+struct Copy { int x, y; float a; };
+
+constexpr int FrameGapMs(int hz, bool fast) {
+    const int interval = (fast ? 250 : 500) / hz;
+    const int minimum = fast ? 2 : 3;
+    return interval > minimum ? interval : minimum;
+}
+
+// Add the latest position as one more afterimage, using the opacity of the
+// most recent existing copy. No trail means no head; it fades with the trail.
+inline bool AppendCursorHead(Copy* copies, int& count, int capacity, int x, int y,
+                             int hotspotX, int hotspotY, int minX, int minY) {
+    if (count <= 0 || count >= capacity) return false;
+    const float opacity = copies[count - 1].a;
+    copies[count++] = {x - hotspotX - minX, y - hotspotY - minY, opacity};
+    return true;
+}
+
+// Premultiplied BGRA source-over, bit-identical to the scalar implementation.
+// SSE2 is part of the x86-64 baseline, so no CPU feature dispatch is needed.
+static inline void BlendPixels(uint32_t* canvas, int canvasWidth,
+                               const uint32_t* picture, int pictureWidth, int pictureHeight,
+                               const int* spans, int opacity, int ox, int oy) {
+    const uint32_t k = static_cast<uint32_t>(opacity) + 1;
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i scale = _mm_set1_epi16(static_cast<short>(k));
+    const __m128i full = _mm_set1_epi32(256);
+    for (int y = 0; y < pictureHeight; ++y) {
+        uint32_t* dst = canvas + (oy + y) * canvasWidth + ox;
+        const uint32_t* src = picture + y * pictureWidth;
+        int x = spans[2 * y], end = spans[2 * y + 1];
+        for (; x + 4 <= end; x += 4) {
+            __m128i s = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + x));
+            __m128i lo = _mm_srli_epi16(_mm_mullo_epi16(_mm_unpacklo_epi8(s, zero), scale), 8);
+            __m128i hi = _mm_srli_epi16(_mm_mullo_epi16(_mm_unpackhi_epi8(s, zero), scale), 8);
+            s = _mm_packus_epi16(lo, hi);
+
+            // Replicate each pixel's inverse alpha across its four 16-bit channels.
+            __m128i inv = _mm_sub_epi32(full, _mm_srli_epi32(s, 24));
+            inv = _mm_shufflelo_epi16(inv, _MM_SHUFFLE(2, 2, 0, 0));
+            inv = _mm_shufflehi_epi16(inv, _MM_SHUFFLE(2, 2, 0, 0));
+            __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dst + x));
+            lo = _mm_srli_epi16(_mm_mullo_epi16(_mm_unpacklo_epi8(d, zero),
+                                                _mm_unpacklo_epi32(inv, inv)), 8);
+            hi = _mm_srli_epi16(_mm_mullo_epi16(_mm_unpackhi_epi8(d, zero),
+                                                _mm_unpackhi_epi32(inv, inv)), 8);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x),
+                             _mm_add_epi32(s, _mm_packus_epi16(lo, hi)));
+        }
+        for (; x < end; ++x) {
+            uint32_t s = src[x];
+            if (!s) continue;
+            s = ((s & 0xFF00FF) * k >> 8 & 0xFF00FF) |
+                ((s >> 8 & 0xFF00FF) * k & 0xFF00FF00);
+            uint32_t inv = 256 - (s >> 24), d = dst[x];
+            dst[x] = s + (((d & 0xFF00FF) * inv >> 8 & 0xFF00FF) |
+                          ((d >> 8 & 0xFF00FF) * inv & 0xFF00FF00));
+        }
+    }
+}
+// END TESTABLE PIXEL AND TRAIL KERNELS
 
 #define HOLD_MS        10      // how long after the last fast moment the cursor may come back
 #define SHOW_WINDOW_MS 12      // the speed that brings the cursor back is measured over just this many ms
@@ -269,7 +326,7 @@ static DWORD WINAPI SampleThread(void*) {
             hidePxPerCm = mainPxPerCm * dpi / mainDpi;
             // Half a refresh: frames are not timed to the screen's refreshes, so a whole one would leave the blur
             // fresh on some refreshes and almost a refresh old on others, and it would jitter against the pointer.
-            g_monGap = FrameGapMs(hz, CURMB_FAST_FRAMES != 0);
+            g_monGap = FrameGapMs(hz, false);
         }
 
         EnterCriticalSection(&g_gate);
@@ -786,10 +843,7 @@ static bool Render() {
     np = g_histN;
     memcpy(pts, g_hist, np * sizeof(Sample));
     LeaveCriticalSection(&g_gate);
-    // Keep a replacement pointer visible while the system cursors are being restored,
-    // including after motion stops. A fullscreen pause or an app-hidden cursor still wins.
-    const bool drawHead = CURMB_SHARP_HEAD && g_blankActive.load();
-    if (!visible || np < (drawHead ? 1 : 2) || (!g_drawing && !drawHead)) return Hide();
+    if (!visible || np < 2 || !g_drawing) return Hide();
     if (g_spritesStale && !g_blankActive) {   // the cursor scheme, size or colour may have changed
         g_spritesStale = 0;
         FreeSprites();
@@ -812,7 +866,7 @@ static bool Render() {
     Sample last = pts[np - 1];
     bool anyMove = false;
     for (int i = 0; i < np && !anyMove; i++) anyMove = pts[i].x != last.x || pts[i].y != last.y;
-    if (!anyMove && !drawHead) return Hide();   // stationary: only the hidden cursor needs a frame
+    if (!anyMove) return Hide();   // stationary: nothing to blur
 
     // the picture at the size Windows draws the cursor on this monitor
     double f = (double)size / sp->w;
@@ -834,14 +888,13 @@ static bool Render() {
     double cover = COVER_PX * size / 32.0, peak = g_opacity / 100.0, trail = g_trailMs;
     LONGLONG now = Now();
     int n = 0;
-    const int trailLimit = COPY_BUF - (drawHead ? 1 : 0);
-    for (int i = 1; i < np && n < trailLimit; i++) {
+    for (int i = 1; i < np && n < COPY_BUF; i++) {
         Sample a = pts[i - 1], b = pts[i];
         double dx = b.x - a.x, dy = b.y - a.y, d = lengths[i];
         if (d < 0.5) continue;
         int k = (int)(d / step);
         if (k < 1) k = 1;
-        for (int c = 0; c < k && n < trailLimit; c++) {
+        for (int c = 0; c < k && n < COPY_BUF; c++) {
             double t = (double)c / k;
             double age = (now - (a.t + (b.t - a.t) * t)) / trail;   // 0 at the pointer, 1 at the end of the trail
             if (age >= 1) continue;
@@ -855,8 +908,6 @@ static bool Render() {
                            alpha > 1 ? 1.0f : (float)alpha};
         }
     }
-    if (drawHead && g_blankActive.load())
-        AppendCursorHead(copies, n, last.x, last.y, hx, hy, minX, minY);
     if (!n) return Hide();
     g_drawFailed = !Draw(sp, sw, sh, copies, n, minX, minY, maxX - minX, maxY - minY, {last.x, last.y});
     if (g_drawFailed) {
@@ -964,15 +1015,8 @@ static DWORD WINAPI RenderThread(void*) {
         }
         if (Now() - lastDraw < g_monGap) continue;
         pending = false;
-#if CURMB_FAST_FRAMES
-        LONGLONG drawStarted = Now();
-#endif
         if (Render()) {
-#if CURMB_FAST_FRAMES
-            lastDraw = drawStarted;
-#else
             lastDraw = Now();
-#endif
             trimmed = false;
         }
     }
