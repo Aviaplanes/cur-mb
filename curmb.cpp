@@ -2,6 +2,7 @@
 // No Windhawk runtime or process injection is used.
 #include <windows.h>
 #include "blend.h"
+#include "trail.h"
 #include <atomic>
 #include <mmsystem.h>
 #include <shellapi.h>
@@ -11,6 +12,13 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef CURMB_SHARP_HEAD
+#define CURMB_SHARP_HEAD 0
+#endif
+#ifndef CURMB_FAST_FRAMES
+#define CURMB_FAST_FRAMES 0
+#endif
 
 #define HOLD_MS        10      // how long after the last fast moment the cursor may come back
 #define SHOW_WINDOW_MS 12      // the speed that brings the cursor back is measured over just this many ms
@@ -24,7 +32,6 @@
 
 struct Sample { int x, y; LONGLONG t; };
 struct Sprite { int w, h, hx, hy, id; UINT32* px; };   // cursor picture at its own size: premultiplied BGRA, hotspot
-struct Copy { int x, y; float a; };                   // one copy: top-left relative to the frame, opacity 0-1
 
 // Values baked in from settings.txt.
 static constexpr int g_opacity = 45;
@@ -262,7 +269,7 @@ static DWORD WINAPI SampleThread(void*) {
             hidePxPerCm = mainPxPerCm * dpi / mainDpi;
             // Half a refresh: frames are not timed to the screen's refreshes, so a whole one would leave the blur
             // fresh on some refreshes and almost a refresh old on others, and it would jitter against the pointer.
-            g_monGap = 500 / hz > 3 ? 500 / hz : 3;
+            g_monGap = FrameGapMs(hz, CURMB_FAST_FRAMES != 0);
         }
 
         EnterCriticalSection(&g_gate);
@@ -779,7 +786,10 @@ static bool Render() {
     np = g_histN;
     memcpy(pts, g_hist, np * sizeof(Sample));
     LeaveCriticalSection(&g_gate);
-    if (!visible || np < 2 || !g_drawing) return Hide();
+    // Keep a replacement pointer visible while the system cursors are being restored,
+    // including after motion stops. A fullscreen pause or an app-hidden cursor still wins.
+    const bool drawHead = CURMB_SHARP_HEAD && g_blankActive.load();
+    if (!visible || np < (drawHead ? 1 : 2) || (!g_drawing && !drawHead)) return Hide();
     if (g_spritesStale && !g_blankActive) {   // the cursor scheme, size or colour may have changed
         g_spritesStale = 0;
         FreeSprites();
@@ -802,7 +812,7 @@ static bool Render() {
     Sample last = pts[np - 1];
     bool anyMove = false;
     for (int i = 0; i < np && !anyMove; i++) anyMove = pts[i].x != last.x || pts[i].y != last.y;
-    if (!anyMove) return Hide();   // stationary: nothing to blur
+    if (!anyMove && !drawHead) return Hide();   // stationary: only the hidden cursor needs a frame
 
     // the picture at the size Windows draws the cursor on this monitor
     double f = (double)size / sp->w;
@@ -824,13 +834,14 @@ static bool Render() {
     double cover = COVER_PX * size / 32.0, peak = g_opacity / 100.0, trail = g_trailMs;
     LONGLONG now = Now();
     int n = 0;
-    for (int i = 1; i < np && n < COPY_BUF; i++) {
+    const int trailLimit = COPY_BUF - (drawHead ? 1 : 0);
+    for (int i = 1; i < np && n < trailLimit; i++) {
         Sample a = pts[i - 1], b = pts[i];
         double dx = b.x - a.x, dy = b.y - a.y, d = lengths[i];
         if (d < 0.5) continue;
         int k = (int)(d / step);
         if (k < 1) k = 1;
-        for (int c = 0; c < k && n < COPY_BUF; c++) {
+        for (int c = 0; c < k && n < trailLimit; c++) {
             double t = (double)c / k;
             double age = (now - (a.t + (b.t - a.t) * t)) / trail;   // 0 at the pointer, 1 at the end of the trail
             if (age >= 1) continue;
@@ -844,6 +855,8 @@ static bool Render() {
                            alpha > 1 ? 1.0f : (float)alpha};
         }
     }
+    if (drawHead && g_blankActive.load())
+        AppendCursorHead(copies, n, last.x, last.y, hx, hy, minX, minY);
     if (!n) return Hide();
     g_drawFailed = !Draw(sp, sw, sh, copies, n, minX, minY, maxX - minX, maxY - minY, {last.x, last.y});
     if (g_drawFailed) {
@@ -951,8 +964,15 @@ static DWORD WINAPI RenderThread(void*) {
         }
         if (Now() - lastDraw < g_monGap) continue;
         pending = false;
+#if CURMB_FAST_FRAMES
+        LONGLONG drawStarted = Now();
+#endif
         if (Render()) {
+#if CURMB_FAST_FRAMES
+            lastDraw = drawStarted;
+#else
             lastDraw = Now();
+#endif
             trimmed = false;
         }
     }
