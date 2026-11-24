@@ -1,0 +1,17 @@
+trail opacity 
+45
+
+minimum blur speed 
+50
+
+trail length
+20
+
+hide the real cursor when moving very fast
+true
+
+hide above speed 
+90
+
+pause in fullscreen apps and games 
+true
