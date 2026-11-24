@@ -1,6 +1,7 @@
 // Standalone adaptation of mod.wh.cpp (Unlicense, sidlikesgrapess).
 // No Windhawk runtime or process injection is used.
 #include <windows.h>
+#include "blend.h"
 #include <atomic>
 #include <mmsystem.h>
 #include <shellapi.h>
@@ -664,20 +665,9 @@ static bool Resize(const Sprite* sp, int w, int h) {
     return true;
 }
 
-// Draws the picture at (ox, oy) at opacity a (1-255): premultiplied "source over", two channels per multiplication.
+// Draw one premultiplied cursor copy into the canvas.
 static void Blend(int a, int ox, int oy) {
-    UINT32 k = (UINT32)a + 1;   // 2-256, so full opacity is exact
-    for (int y = 0; y < g_picH; y++) {
-        UINT32* row = g_bits + (oy + y) * g_canvasW + ox;
-        const UINT32* src = g_pic + y * g_picW;
-        for (int x = g_span[2 * y]; x < g_span[2 * y + 1]; x++) {
-            UINT32 s = src[x];
-            if (!s) continue;
-            s = ((s & 0xFF00FF) * k >> 8 & 0xFF00FF) | ((s >> 8 & 0xFF00FF) * k & 0xFF00FF00);
-            UINT32 inv = 256 - (s >> 24), d = row[x];
-            row[x] = s + (((d & 0xFF00FF) * inv >> 8 & 0xFF00FF) | ((d >> 8 & 0xFF00FF) * inv & 0xFF00FF00));
-        }
-    }
+    BlendPixels(g_bits, g_canvasW, g_pic, g_picW, g_picH, g_span, a, ox, oy);
 }
 
 static HWND g_target;
@@ -778,6 +768,7 @@ static bool Hide() {
 static bool Render() {
     static Sample pts[MAX_SAMPLES];
     static Copy copies[COPY_BUF];
+    double lengths[MAX_SAMPLES];
     int np, size;
     HCURSOR handle;
     bool visible;
@@ -824,7 +815,10 @@ static bool Render() {
         if (pts[i].y - hy < minY) minY = pts[i].y - hy;
         if (pts[i].x - hx + sw > maxX) maxX = pts[i].x - hx + sw;
         if (pts[i].y - hy + sh > maxY) maxY = pts[i].y - hy + sh;
-        if (i) total += Dist(pts[i - 1], pts[i]);
+        if (i) {
+            lengths[i] = Dist(pts[i - 1], pts[i]);
+            total += lengths[i];
+        }
     }
     double step = total / MAX_COPIES > 1 ? total / MAX_COPIES : 1;   // dense, faint copies read as a smooth blur
     double cover = COVER_PX * size / 32.0, peak = g_opacity / 100.0, trail = g_trailMs;
@@ -832,7 +826,7 @@ static bool Render() {
     int n = 0;
     for (int i = 1; i < np && n < COPY_BUF; i++) {
         Sample a = pts[i - 1], b = pts[i];
-        double dx = b.x - a.x, dy = b.y - a.y, d = sqrt(dx * dx + dy * dy);
+        double dx = b.x - a.x, dy = b.y - a.y, d = lengths[i];
         if (d < 0.5) continue;
         int k = (int)(d / step);
         if (k < 1) k = 1;
